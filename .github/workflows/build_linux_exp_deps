@@ -1,0 +1,170 @@
+#build_linux
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libavformat-dev \
+            libavcodec-dev \
+            libavfilter-dev \
+            libavutil-dev \
+            libswscale-dev \
+            libswresample-dev \
+            libsdl2-dev \
+            libsdl2-ttf-dev
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Run unit tests
+        run: make check
+
+      - name: Verify build output
+        run: |
+          if [ -f "video-compare" ]; then
+            echo "Build successful!"
+            ls -lh video-compare
+            file video-compare
+          else
+            echo "Build failed: video-compare not found"
+            exit 1
+          fi
+
+      - name: Show dependencies
+        run: |
+          echo "Direct dependencies:"
+          ldd ./video-compare
+
+      - name: Create bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p bundle/lib
+
+          cp video-compare bundle/
+          cp LICENSE.md bundle/
+
+          # The project requires the complete licenses directory
+          cp -r licenses bundle/
+
+          # Collect runtime shared libraries.
+          #
+          # We deliberately exclude the fundamental system libraries that
+          # should be supplied by the target Linux system.
+          collect_libs() {
+              local file="$1"
+
+              ldd "$file" |
+              awk '
+                  /=> \// {
+                      print $3
+                  }
+                  /^\// {
+                      print $1
+                  }
+              ' |
+              while read -r lib; do
+                  [ -f "$lib" ] || continue
+
+                  case "$lib" in
+                      /lib/x86_64-linux-gnu/libc.so.*)
+                          continue ;;
+                      /lib/x86_64-linux-gnu/libm.so.*)
+                          continue ;;
+                      /lib/x86_64-linux-gnu/libpthread.so.*)
+                          continue ;;
+                      /lib/x86_64-linux-gnu/libdl.so.*)
+                          continue ;;
+                      /lib/x86_64-linux-gnu/librt.so.*)
+                          continue ;;
+                      /lib/x86_64-linux-gnu/ld-linux*.so.*)
+                          continue ;;
+                      /lib64/ld-linux*.so.*)
+                          continue ;;
+                  esac
+
+                  dest="bundle/lib/$(basename "$lib")"
+
+                  if [ ! -e "$dest" ]; then
+                      echo "Bundling: $lib"
+                      cp -L "$lib" "$dest"
+                  fi
+              done
+          }
+
+          # First pass: dependencies of the executable.
+          collect_libs bundle/video-compare
+
+          # Repeatedly inspect bundled libraries because they can themselves
+          # depend on other libraries.
+          while true; do
+              before=$(find bundle/lib -type f | wc -l)
+
+              while read -r lib; do
+                  collect_libs "$lib"
+              done < <(find bundle/lib -type f)
+
+              after=$(find bundle/lib -type f | wc -l)
+
+              if [ "$before" -eq "$after" ]; then
+                  break
+              fi
+          done
+
+          # Tell the executable to look for libraries relative to itself.
+          patchelf --set-rpath '$ORIGIN/lib' bundle/video-compare
+
+          echo
+          echo "Bundled libraries:"
+          ls -lh bundle/lib
+
+      - name: Verify bundle
+        shell: bash
+        run: |
+          set -e
+
+          echo "RPATH:"
+          patchelf --print-rpath bundle/video-compare
+
+          echo
+          echo "Dependencies:"
+          ldd bundle/video-compare
+
+          echo
+          echo "Checking for missing libraries:"
+
+          if ldd bundle/video-compare | grep -q 'not found'; then
+              echo "ERROR: Missing library dependencies"
+              exit 1
+          fi
+
+          echo "All dependencies resolved."
+
+      - name: Package
+        run: |
+          tar -czf video-compare-linux-x86_64.tar.gz \
+            -C bundle \
+            .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-compare-linux-x86_64
+          path: video-compare-linux-x86_64.tar.gz
